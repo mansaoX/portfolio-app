@@ -28,45 +28,28 @@ if not transactions.data:
 else:
     df = pd.DataFrame(transactions.data)
 
-    # Calculate net quantity per instrument
-    df['signed_quantity'] = df.apply(
-        lambda r: r['quantity'] if r['type'] in ['buy', 'inflow']
-        else -r['quantity'] if r['type'] in ['sell', 'outflow']
-        else 0,
-        axis=1
-    )
+# Calculate net quantity per instrument using full transaction logic
+    from engine.calculations import apply_transaction_to_positions
+    df_no_splits = df[df['type'] != 'split']
+    splits_df = df[df['type'] == 'split'][['isin', 'quantity']].copy()
 
-    # Calculate average price per instrument (only buy/inflow transactions)
-    avg_price = df[df['type'].isin(['buy', 'inflow'])].groupby('isin').apply(
-        lambda x: (x['quantity'] * x['price']).sum() / x['quantity'].sum()
-    ).reset_index(name='avg_price')
+    movements = apply_transaction_to_positions(df_no_splits)
 
-    # Subtract cash when buy happens, add cash when sell happens
-    cash_rows = []
-    for _, r in df.iterrows():
-        if r['type'] == 'buy':
-            cash_rows.append({
-                'isin': f"cash_{r['currency']}",
-                'name': r['currency'],
-                'currency': r['currency'],
-                'signed_quantity': -(r['quantity'] * r['price'])
-            })
-        elif r['type'] == 'sell':
-            cash_rows.append({
-                'isin': f"cash_{r['currency']}",
-                'name': r['currency'],
-                'currency': r['currency'],
-                'signed_quantity': r['quantity'] * r['price']
-            })
+    if movements.empty:
+        st.warning("No position data found.")
+    else:
+        positions = movements.groupby(['isin', 'currency', 'fx_rate_to_ref'])['signed_quantity'].sum().reset_index()
 
-    positions = df.groupby(['isin', 'name', 'currency'])['signed_quantity'].sum().reset_index()
+        # Apply splits
+        if not splits_df.empty:
+            from engine.calculations import apply_splits
+            positions = apply_splits(positions, splits_df)
 
-    if cash_rows:
-        cash_df = pd.DataFrame(cash_rows)
-        cash_agg = cash_df.groupby(['isin', 'name', 'currency'])['signed_quantity'].sum().reset_index()
-        positions = pd.concat([positions, cash_agg]).groupby(['isin', 'name', 'currency'])['signed_quantity'].sum().reset_index()
+        # Merge name from transactions
+        names = df[['isin', 'name']].drop_duplicates('isin')
+        positions = positions.merge(names, on='isin', how='left')
 
-    positions = positions[positions['signed_quantity'] != 0]
+        positions = positions[positions['signed_quantity'] != 0]
 
     # Merge average price
     positions = positions.merge(avg_price, on='isin', how='left')
