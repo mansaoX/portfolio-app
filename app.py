@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import date
 from supabase_client import supabase
+from engine.calculations import apply_transaction_to_positions, apply_splits
 
 st.set_page_config(page_title="Portfolio Manager", layout="wide")
 st.title("Portfolio Manager")
@@ -28,8 +29,12 @@ if not transactions.data:
 else:
     df = pd.DataFrame(transactions.data)
 
-# Calculate net quantity per instrument using full transaction logic
-    from engine.calculations import apply_transaction_to_positions
+    # --- Average price (buy/inflow/transfer_in only) ---
+    avg_price = df[df['type'].isin(['buy', 'inflow', 'transfer_in'])].groupby('isin').apply(
+        lambda x: (x['quantity'] * x['price']).sum() / x['quantity'].sum()
+    ).reset_index(name='avg_price')
+
+    # --- Calculate positions ---
     df_no_splits = df[df['type'] != 'split']
     splits_df = df[df['type'] == 'split'][['isin', 'quantity']].copy()
 
@@ -42,7 +47,6 @@ else:
 
         # Apply splits
         if not splits_df.empty:
-            from engine.calculations import apply_splits
             positions = apply_splits(positions, splits_df)
 
         # Merge name from transactions
@@ -51,81 +55,75 @@ else:
 
         positions = positions[positions['signed_quantity'] != 0]
 
-    # Merge average price
-    positions = positions.merge(avg_price, on='isin', how='left')
+        # Merge average price
+        positions = positions.merge(avg_price, on='isin', how='left')
+        positions.loc[positions['isin'].str.startswith('cash_'), 'avg_price'] = 1.0
 
-    # For cash, average price is always 1
-    positions.loc[positions['isin'].str.startswith('cash_'), 'avg_price'] = 1.0
+        # Get asset type from instruments table
+        instruments = supabase.table("instruments").select("isin, asset_type").execute()
+        inst_df = pd.DataFrame(instruments.data)
+        positions = positions.merge(inst_df, on='isin', how='left')
+        positions.loc[positions['isin'].str.startswith('cash_'), 'asset_type'] = 'cash'
+        positions['asset_type'] = positions['asset_type'].fillna('unknown')
 
-    # Get asset type from instruments table
-    instruments = supabase.table("instruments").select("isin, asset_type").execute()
-    inst_df = pd.DataFrame(instruments.data)
-    positions = positions.merge(inst_df, on='isin', how='left')
+        # Get latest price per instrument on or before selected date
+        prices_list = []
+        for _, row in positions.iterrows():
+            price = supabase.table("prices")\
+                .select("price, date")\
+                .eq("isin", row['isin'])\
+                .lte("date", selected_date.strftime('%Y-%m-%d'))\
+                .order("date", desc=True)\
+                .limit(1)\
+                .execute()
+            if price.data:
+                prices_list.append({
+                    "isin": row['isin'],
+                    "last_price": price.data[0]['price'],
+                    "price_date": price.data[0]['date']
+                })
+            elif row['isin'].startswith('cash_'):
+                prices_list.append({
+                    "isin": row['isin'],
+                    "last_price": 1.0,
+                    "price_date": str(selected_date)
+                })
+            else:
+                prices_list.append({
+                    "isin": row['isin'],
+                    "last_price": None,
+                    "price_date": None
+                })
 
-    # For cash positions not in instruments table, set asset_type to 'cash'
-    positions.loc[positions['isin'].str.startswith('cash_'), 'asset_type'] = 'cash'
-    positions['asset_type'] = positions['asset_type'].fillna('unknown')
+        prices_df = pd.DataFrame(prices_list)
+        positions = positions.merge(prices_df, on='isin', how='left')
 
-    # Get latest price per instrument on or before selected date
-    prices_list = []
-    for _, row in positions.iterrows():
-        price = supabase.table("prices")\
-            .select("price, date")\
-            .eq("isin", row['isin'])\
-            .lte("date", selected_date.strftime('%Y-%m-%d'))\
-            .order("date", desc=True)\
-            .limit(1)\
-            .execute()
-        if price.data:
-            prices_list.append({
-                "isin": row['isin'],
-                "last_price": price.data[0]['price'],
-                "price_date": price.data[0]['date']
+        # Calculate market value
+        positions['market_value'] = positions['signed_quantity'] * positions['last_price']
+
+        # Format price date for display
+        positions['price_date'] = pd.to_datetime(positions['price_date']).dt.strftime('%d/%m/%Y')
+
+        # Display
+        st.subheader(f"Portfolio as of {selected_date.strftime('%d/%m/%Y')}")
+
+        for asset_type in sorted(positions['asset_type'].unique()):
+            st.markdown(f"### {asset_type.upper()}")
+            subset = positions[positions['asset_type'] == asset_type][
+                ['name', 'isin', 'signed_quantity', 'avg_price', 'last_price', 'price_date', 'currency', 'market_value']
+            ].rename(columns={
+                'name': 'Instrument',
+                'isin': 'ISIN',
+                'signed_quantity': 'Quantity',
+                'avg_price': 'Avg Price',
+                'last_price': 'Last Price',
+                'price_date': 'Price Date',
+                'currency': 'Currency',
+                'market_value': 'Market Value'
             })
-        elif row['isin'].startswith('cash_'):
-            prices_list.append({
-                "isin": row['isin'],
-                "last_price": 1.0,
-                "price_date": str(selected_date)
-            })
-        else:
-            prices_list.append({
-                "isin": row['isin'],
-                "last_price": None,
-                "price_date": None
-            })
+            st.dataframe(subset, use_container_width=True, hide_index=True)
+            subtotal = positions[positions['asset_type'] == asset_type]['market_value'].sum()
+            st.caption(f"Subtotal: {subtotal:,.2f}")
 
-    prices_df = pd.DataFrame(prices_list)
-    positions = positions.merge(prices_df, on='isin', how='left')
-
-    # Calculate market value
-    positions['market_value'] = positions['signed_quantity'] * positions['last_price']
-
-    # Format price date for display
-    positions['price_date'] = pd.to_datetime(positions['price_date']).dt.strftime('%d/%m/%Y')
-
-    # Display header
-    st.subheader(f"Portfolio as of {selected_date.strftime('%d/%m/%Y')}")
-
-    # Display one table per asset type
-    for asset_type in sorted(positions['asset_type'].unique()):
-        st.markdown(f"### {asset_type.upper()}")
-        subset = positions[positions['asset_type'] == asset_type][
-            ['name', 'isin', 'signed_quantity', 'avg_price', 'last_price', 'price_date', 'currency', 'market_value']
-        ].rename(columns={
-            'name': 'Instrument',
-            'isin': 'ISIN',
-            'signed_quantity': 'Quantity',
-            'avg_price': 'Avg Price',
-            'last_price': 'Last Price',
-            'price_date': 'Price Date',
-            'currency': 'Currency',
-            'market_value': 'Market Value'
-        })
-        st.dataframe(subset, use_container_width=True, hide_index=True)
-        subtotal = positions[positions['asset_type'] == asset_type]['market_value'].sum()
-        st.caption(f"Subtotal: {subtotal:,.2f}")
-
-    # Grand total
-    total = positions['market_value'].sum()
-    st.metric("Total Portfolio Value", f"{total:,.2f}")
+        total = positions['market_value'].sum()
+        st.metric("Total Portfolio Value", f"{total:,.2f}")
